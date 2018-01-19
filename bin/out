@@ -62,6 +62,48 @@ start_job() {
     fi
 }
 
+create_and_run_job() {
+    JOB_NAME=$1
+    DEPLOYMENT_PATH=$2
+    DRY_RUN=$3
+
+    [ -n "$JOB_NAME" ] || exit 1
+    [ -n "$DEPLOYMENT_PATH" ] || exit 1
+
+    if [[ "$DRY_RUN" == "null" ]] || [[ "$DRY_RUN" == "false" ]]; then
+        # cleanup any stale jobs with this name
+        $KUBECTL delete job $JOB_NAME 2&> /dev/null || true
+
+        # create the job by creating a pod
+        cat $DEPLOYMENT_PATH | envsubst | kubectl create -f -
+
+        # wait for Kube job to go into Pending state
+        while [ true ]; do
+            phase=`$KUBECTL get pods -a --selector="name=$JOB_NAME" -o 'jsonpath={.items[0].status.phase}' || 'false'`
+            if [[ "$phase" != 'Pending' ]]; then
+                break
+            fi
+        done
+
+        # attach to the output of this pod
+        echo "************ $JOB_NAME output start ************"
+        $KUBECTL attach $(kubectl get pods -a --selector="name=$JOB_NAME" -o 'jsonpath={.items[0].metadata.name}')
+        echo "************ $JOB_NAME output end ************"
+
+        # If job fails, delete it and return error to Concourse
+        while [ true ]; do
+          succeeded=`$KUBECTL get jobs $JOB_NAME -o 'jsonpath={.status.succeeded}'`
+          failed=`$KUBECTL get jobs $JOB_NAME -o 'jsonpath={.status.failed}'`
+        if [[ "$succeeded" == "1" ]]; then
+            break
+          elif [[ "$failed" -gt "0" ]]; then
+            $KUBECTL delete job $JOB_NAME
+            exit 1
+          fi
+        done
+    fi
+}
+
 DEBUG=$(jq -r .source.debug < "$payload")
 [[ "$DEBUG" == "true" ]] && { echo "Enabling debug mode.";set -x; }
 
@@ -94,6 +136,7 @@ fi
 export KUBECTL
 
 ROLLBACK=$(jq -r .params.rollback < "$payload")
+RUN_JOB=$(jq -r .params.rollback < "$payload")
 RESOURCE_TYPE=$(jq -r .source.resource_type < "$payload")
 RESOURCE_NAME=$(jq -r .source.resource_name < "$payload")
 DRY_RUN=$(jq -r .params.dry_run < "$payload")
@@ -109,6 +152,10 @@ fi
 if [[ "$RESOURCE_TYPE" = 'deployment' ]]; then
     if [[ "$ROLLBACK" = "true" ]]; then
         rollback "$RESOURCE_NAME" "$DRY_RUN";
+    elif [[ "$RUN_JOB" = "true" ]]; then
+        JOB_NAME=$(jq -r .params.job_name < "$payload")
+        DEPLOYMENT_PATH=$(jq -r .source.deployment_file < "$payload")
+        create_and_run_job "$JOB_NAME" "$DEPLOYMENT_PATH" "$DRY_RUN";
     else
         case $RESOURCE_TYPE in
             deployment)
