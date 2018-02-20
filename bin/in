@@ -8,13 +8,45 @@ echo "Starting in"
 payload="$(mktemp "$TMPDIR/k8s-resource-request.XXXXXX")"
 cat > "$payload" <&0
 
+# This looks inside the logs of the pod that ran this job to find out if it
+# was successful or not
+check_logs_and_print_message_and_exit() {
+    JOB_NAME=$1
+    POD=`$KUBECTL get pods -a --selector="name=$JOB_NAME" -o 'jsonpath={.items[0].metadata.name}'`
+    LOG_MSG="* To see logs, run: $KUBECTL logs $POD"
+    logs=`$KUBECTL logs $POD`
+
+    # Extract lines that start with Job exited with code <code>, where <code>
+    # is a one-digit wildcard. The following variable "all_log_lines_with_exit_codes"
+    # looks like "Job exited with code 0 Job exited with code -1"
+    all_log_lines_with_exit_codes=`echo $logs | grep -o '\bJob exited with code .\w*'`
+
+    # This extracts the exit code from the first line in the above variable
+    reliable_exit_code=$(
+    	echo $all_log_lines_with_exit_codes |
+    	sed "s/Job/\\`echo -e '\n\r'`Job/g" |
+    	tail -n 2 | head -n 1 | tail -c 3 | head -c 1
+		)
+
+    if [ "$reliable_exit_code" == "0" ]; then
+        echo -e "\033[92m* Your job succeeded\033[0m"
+        echo "$LOG_MSG"
+        echo "In complete"
+        echo "$result" | jq -s add  >&3
+    else
+        echo -e "\033[91m* Welp, your job failed.\033[0m"
+        echo "$LOG_MSG"
+        echo "In complete"
+        echo "$result" | jq -s add  >&3
+        exit 1
+    fi
+}
 cd "$1"
 
 mkdir -p /root/.kube
 
 KUBE_URL=$(jq -r .source.cluster_url < "$payload")
 NAMESPACE=$(jq -r .source.namespace < "$payload")
-
 KUBECTL="/usr/local/bin/kubectl --server=$KUBE_URL --namespace=$NAMESPACE"
 
 # configure SSL Certs if available
@@ -44,10 +76,27 @@ else
 
     RESOURCE="$RESOURCE_TYPE/$RESOURCE_NAME"
 
-    IMG=$($KUBECTL get -o json "$RESOURCE" | jq -r '.spec.template.spec.containers[0].image')
+    RUN_JOB=$(jq -r .params.run_job < "$payload")
+    DRY_RUN=$(jq -r .params.dry_run < "$payload")
 
-    result="$(jq -n "{version:{container:\"$IMG\"}}")"
+    if [[ "$RESOURCE_TYPE" = 'job' ]]; then
+        JOB_NAME=$(jq -r .source.job_name < "$payload")
+        while [ true ]; do
+            succeeded=`$KUBECTL get jobs $JOB_NAME -o 'jsonpath={.status.succeeded}'`
+            failed=`$KUBECTL get jobs $JOB_NAME -o 'jsonpath={.status.failed}'`
+            if [[ "$succeeded" == "1" ]]; then
+                check_logs_and_print_message_and_exit "$JOB_NAME";
+                break;
+            elif [[ "$failed" -gt "0" ]]; then
+                check_logs_and_print_message_and_exit "$JOB_NAME";
+                break;
+            fi
+            sleep 1 # So that log output in Concourse doesn't go whack
+        done
+    else    # Kube deployments
+        IMG=$($KUBECTL get -o json "$RESOURCE" | jq -r '.spec.template.spec.containers[0].image')
+        result="$(jq -n "{version:{container:\"$IMG\"}}")"
+        echo "In complete"
+        echo "$result" | jq -s add  >&3
+    fi
 fi
-
-echo "In complete"
-echo "$result" | jq -s add  >&3

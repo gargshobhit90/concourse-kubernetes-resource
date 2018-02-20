@@ -9,6 +9,11 @@ echo "Starting out"
 payload="$(mktemp "$TMPDIR/k8s-resource-request.XXXXXX")"
 cat > "$payload" <&0
 
+DRY_RUN=$(jq -r .params.dry_run < "$payload")
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "********************** Running in DRY_RUN mode **********************"
+fi
+
 rollback() {
     DEPLOYMENT=$1
     DRY_RUN=$2
@@ -57,8 +62,49 @@ start_job() {
     [ -n "$IMAGE" ] || exit 1
     [ -n "$UID" ] || exit 1
 
+    echo "Running: cat "$JOB" | IMAGE=$IMAGE UID=$UID envsubst | $KUBECTL create --record -f -"
     if [[ "$DRY_RUN" == "null" ]] || [[ "$DRY_RUN" == "false" ]]; then
         cat "$JOB" | IMAGE=$IMAGE UID=$UID envsubst | $KUBECTL create --record -f -
+    fi
+}
+
+create_and_run_job() {
+    JOB_NAME=$1
+    DEPLOYMENT_PATH=$2
+    DRY_RUN=$3
+
+    [ -n "$JOB_NAME" ] || exit 1
+    [ -n "$DEPLOYMENT_PATH" ] || exit 1
+
+    echo "Running: cat "${DEPLOYMENT_PATH}" | $KUBECTL create --record -f -"
+    if [[ "$DRY_RUN" == "null" ]] || [[ "$DRY_RUN" == "false" ]]; then
+        cat "${DEPLOYMENT_PATH}" | $KUBECTL create --record -f -
+
+        # Wait for the state of the pod to change from Pending, or exit after
+        # 60 seconds (to prevent an infinite loop)
+        start_time=$(date +%s) # time at start of while loop
+        end_time=$(($start_time+60)) # time at which we should break out of the while true loop
+
+        # Wait for the state of the pod to change from Pending
+        while [ true ]; do
+            phase=`$KUBECTL get pods -a --selector="name=$JOB_NAME" -o 'jsonpath={.items[0].status.phase}' || 'false'`
+            current_time=$(date +%s)
+
+            if [[ $current_time > $end_time ]]; then
+                # This means that the pod could not start within 60 seconds of the
+                # job being created. Normally, this should be enough time it to
+                # start. This indicates there is a problem with the system. The dev
+                # can try re-running and investigate further if that doesn't succeed.
+                echo -e "\033[91m* Pod was not able to start. Exiting with error. Please run job again.\033[0m"
+                exit 1
+            fi
+
+            if [[ "$phase" != 'Pending' ]]; then
+                break
+            fi
+
+            sleep 1 # So that log output in Concourse doesn't go whack
+        done
     fi
 }
 
@@ -94,9 +140,9 @@ fi
 export KUBECTL
 
 ROLLBACK=$(jq -r .params.rollback < "$payload")
+RUN_JOB=$(jq -r .params.run_job < "$payload")
 RESOURCE_TYPE=$(jq -r .source.resource_type < "$payload")
 RESOURCE_NAME=$(jq -r .source.resource_name < "$payload")
-DRY_RUN=$(jq -r .params.dry_run < "$payload")
 
 if [[ -z "$RESOURCE_TYPE" ]]; then
     RESOURCE_TYPE=$(jq -r .params.resource_type < "$payload")
@@ -106,7 +152,13 @@ if [[ -z "$RESOURCE_NAME" ]]; then
     RESOURCE_TYPE=$(jq -r .params.resource_name < "$payload")
 fi
 
-if [[ "$RESOURCE_TYPE" = 'deployment' ]]; then
+if [[ "$RESOURCE_TYPE" = 'job' ]]; then
+    if [[ "$RUN_JOB" = "true" ]]; then
+        JOB_NAME=$(jq -r .source.job_name < "$payload")
+        DEPLOYMENT_PATH=$(jq -r .source.deployment_file < "$payload")
+        create_and_run_job "$JOB_NAME" "$DEPLOYMENT_PATH" "$DRY_RUN";
+    fi
+elif [[ "$RESOURCE_TYPE" = 'deployment' ]]; then
     if [[ "$ROLLBACK" = "true" ]]; then
         rollback "$RESOURCE_NAME" "$DRY_RUN";
     else
